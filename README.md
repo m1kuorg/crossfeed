@@ -4,7 +4,7 @@
 
 <br />
 <div align="center">
-  <a href="https://github.com/m1kuorg/qloo">
+  <a href="https://github.com/m1kuorg/crossfeed">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="/docs/readme/banner-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="/docs/readme/banner-light.png">
@@ -21,7 +21,7 @@
     &middot;
     <a href="#">Demo Video</a>
     &middot;
-    <a href="https://github.com/m1kuorg/qloo/issues/new?labels=bug">Report a Bug</a>
+    <a href="https://github.com/m1kuorg/crossfeed/issues/new?labels=bug">Report a Bug</a>
     <br />
   </p>
 
@@ -84,7 +84,7 @@ Beside every Qloo ranking sits the plan an agent without Qloo would make: Claude
 
 It's a product a network's members sign in to, with passkeys, shared networks, a REST API, a TypeScript SDK, an MCP server, and a Claude Code plugin. Anyone can try it as a guest, in one click, on a sample network built from The Ringer's public show names, with labelled sample figures. Crossfeed isn't affiliated with The Ringer.
 
-Built for the [Qloo Agentic Hackathon](https://qloo.devpost.com/): the entry is on [Devpost](https://devpost.com/software/crossfeed), and [docs/SUBMISSION.md](/docs/SUBMISSION.md) is its full text.
+Built for the [Qloo Agentic Hackathon](https://qloo.devpost.com/): the entry is on [Devpost](https://devpost.com/software/crossfeed).
 
 <p align="right"><a href="#readme-top">&uarr;</a></p>
 
@@ -198,7 +198,7 @@ The live app on October 30, 2026, signed in as a guest, on the guest network's s
   <img src="/docs/readme/architecture-light.svg" alt="Crossfeed architecture: browsers, scripts, and AI assistants reach one Cloudflare Worker, which routes to a NetworkAgent per network and a LaunchAgent per launch; both call Claude, and every Qloo call goes through the QlooGateway.">
 </picture>
 
-One Worker serves every surface. Each network and each launch is its own Agents SDK Durable Object, which runs Claude's tool loop, and every Qloo call goes through one gateway Durable Object that caches, paces, retries, and caps them. A D1 database holds only what has to be looked up across them: members, networks, sessions, invites, and API keys. [docs/TRD.md](/docs/TRD.md) has the whole design.
+One Worker serves every surface. Each network and each launch is its own Agents SDK Durable Object, which runs Claude's tool loop, and every Qloo call goes through one gateway Durable Object that caches, paces, retries, and caps them. A D1 database holds only what has to be looked up across them: members, networks, sessions, invites, and API keys.
 
 Made with [Archify](https://github.com/tt-a1i/archify) from [`architecture.json`](/docs/readme/architecture.json), in Crossfeed's colours by [`export-architecture.mjs`](/docs/readme/export-architecture.mjs).
 
@@ -213,7 +213,7 @@ Made with [Archify](https://github.com/tt-a1i/archify) from [`architecture.json`
 - **AI:** Anthropic's [Claude](https://claude.com/product/overview) Haiku 5.5 (`claude-haiku-5-5`), through the Anthropic TypeScript SDK.
 - **Accounts:** passkeys with [SimpleWebAuthn](https://simplewebauthn.dev/).
 - **For programs:** an OpenAPI document from [Zod](https://zod.dev/) schemas, the [Model Context Protocol](https://modelcontextprotocol.io/) TypeScript SDK's server, and SDK types from openapi-typescript.
-- **Tooling:** [Bun](https://bun.com/), Wrangler, [Vitest](https://vitest.dev/) in the Workers runtime, Prettier, commitlint, and [act](https://github.com/nektos/act) for CI.
+- **Tooling:** [Bun](https://bun.com/), Wrangler, [Vitest](https://vitest.dev/) in the Workers runtime, Prettier, and commitlint.
 
 <p align="right"><a href="#readme-top">&uarr;</a></p>
 
@@ -236,11 +236,11 @@ Crossfeed runs on your computer under Vite's dev server, which runs the Worker, 
 
 ### Installation
 
-1.  **Clone and install.** The app is in `apps/`.
+1.  **Clone and install.** The app is in `apps/web/`, the TypeScript SDK in `apps/sdk/`, and the Claude Code plugin in `apps/plugin/`.
 
     ```sh
-    git clone https://github.com/m1kuorg/qloo.git
-    cd qloo/apps
+    git clone https://github.com/m1kuorg/crossfeed.git
+    cd crossfeed/apps/web
     bun install
     ```
 
@@ -270,7 +270,7 @@ Crossfeed runs on your computer under Vite's dev server, which runs the Worker, 
     bun run test
     ```
 
-6.  **Optionally, deploy to Cloudflare.** Replace `account_id` and the D1 `database_id` in `wrangler.jsonc` with your own, set the four secrets with `bunx wrangler secret put`, and run `bun run deploy`. The [apps README](/apps/README.md#deploy) has every step, the preview environment, and the live checks.
+6.  **Optionally, deploy to Cloudflare.** Replace `account_id` and the D1 `database_id` in `wrangler.jsonc` with your own, set the four secrets with `bunx wrangler secret put`, and run `bun run deploy`.
 
 <p align="right"><a href="#readme-top">&uarr;</a></p>
 
@@ -278,7 +278,7 @@ Crossfeed runs on your computer under Vite's dev server, which runs the Worker, 
 
 ## Roadmap
 
-See [open issues](https://github.com/m1kuorg/qloo/issues) for a full list of proposed features (and known issues).
+See [open issues](https://github.com/m1kuorg/crossfeed/issues) for a full list of proposed features (and known issues).
 
 <p align="right"><a href="#readme-top">&uarr;</a></p>
 
@@ -286,8 +286,8 @@ See [open issues](https://github.com/m1kuorg/qloo/issues) for a full list of pro
 
 ## Team
 
-<a href="https://github.com/m1kuorg/qloo/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=m1kuorg/qloo" alt="Crossfeed team" />
+<a href="https://github.com/m1kuorg/crossfeed/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=m1kuorg/crossfeed" alt="Crossfeed team" />
 </a>
 
 Made with [contrib.rocks](https://contrib.rocks).
@@ -302,13 +302,9 @@ Apache 2.0. See [LICENSE](/LICENSE) for more information.
 
 Third-party files keep their own licenses:
 
-- Matt Pocock's [skills](https://github.com/mattpocock/skills), MIT, in `.agents/skills/` and linked from `.claude/skills/`, apart from `graphify` and `impeccable`.
-- The [graphify](https://github.com/safishamsi/graphify) skill, Apache 2.0, in `.agents/skills/graphify/`.
-- The [impeccable](https://impeccable.style/) skill and its agents, Apache 2.0, in `.agents/skills/impeccable/`, `.claude/skills/impeccable/`, and `.claude/agents/`.
-- shadcn/ui's components, MIT, the starting point of `apps/src/components/ui/`.
-- Lucide's icons, ISC, whose paths `apps/src/icons.tsx` draws.
+- shadcn/ui's components, MIT, the starting point of `apps/web/src/components/ui/`.
+- Lucide's icons, ISC, whose paths `apps/web/src/icons.tsx` draws.
 - Schibsted Grotesk, SIL Open Font License 1.1, which the app serves from `@fontsource-variable/schibsted-grotesk`.
-- [docs/references/markdown-style.md](/docs/references/markdown-style.md), adapted from Google's documentation guide, CC BY 3.0.
 
 <p align="right"><a href="#readme-top">&uarr;</a></p>
 

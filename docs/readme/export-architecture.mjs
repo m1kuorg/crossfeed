@@ -1,11 +1,11 @@
-// Exports the README's architecture diagram in Crossfeed's design system (docs/DESIGN.md).
+// Exports the README's architecture diagram in Crossfeed's design system.
 //
 // Archify (https://github.com/tt-a1i/archify) renders docs/readme/architecture.json into a standalone HTML
 // viewer. This script restyles that viewer with Crossfeed's colours and Schibsted Grotesk, then saves the
 // viewer's own SVG export once per colour scheme, through playwright-cli from Homebrew
 // (`brew install playwright-cli`), and takes out the ground the export paints, so each SVG is transparent.
 //
-// Re-run from the repository root after `bun install` in apps/, with archify 3.2.0 cloned somewhere
+// Re-run from the repository root after `bun install` in apps/web/, with archify 3.2.0 cloned somewhere
 // (git clone --depth 1 --branch v3.2.0 https://github.com/tt-a1i/archify <archify>):
 //   node <archify>/archify/bin/archify.mjs finalize architecture docs/readme/architecture.json <work>/architecture.html --repo-root . --quality showcase --json
 //   node docs/readme/export-architecture.mjs <work>/architecture.html
@@ -23,12 +23,12 @@ const font = fs
   .readFileSync(
     path.join(
       out,
-      '../../apps/node_modules/@fontsource-variable/schibsted-grotesk/files/schibsted-grotesk-latin-wght-normal.woff2'
+      '../../apps/web/node_modules/@fontsource-variable/schibsted-grotesk/files/schibsted-grotesk-latin-wght-normal.woff2'
     )
   )
   .toString('base64')
 
-// docs/DESIGN.md's tokens. Crossfeed's own parts are in ink: its clients filled, as its primary button is,
+// The design system's tokens. Crossfeed's own parts are in ink: its clients filled, as its primary button is,
 // and its server outlined. Cloudflare's services sit on the tone step, and the outside parts are outlined in
 // the control colour. Signal orange marks one path, every Qloo call through the gateway.
 const THEMES = {

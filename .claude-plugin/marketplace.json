@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "crossfeed",
-      "source": "./plugins/crossfeed",
+      "source": "./apps/plugin",
       "description": "Plan a podcast network's launch promos and triage its guest pitches with Crossfeed's MCP server and two skills."
     }
   ]

@@ -1,0 +1,916 @@
+import { callable, getAgentByName, getCurrentAgent, type Connection, type ConnectionContext } from 'agents'
+import {
+  CrossfeedAgent,
+  MEMBER_TAG,
+  readLaunch,
+  rosterKey,
+  type LaunchInput,
+  type LaunchSummary,
+  type RosterCopy,
+  type RunSnapshot,
+  type SessionProps,
+  type State
+} from './agent'
+import { sampleLaunchRows } from './directory'
+import { CALL, callNumber } from './evidence'
+import { globalGateway, type QlooGateway } from './gateway'
+import { readSampleInbox, type Booking, type Inbox, type Pitch, type PitchReply } from './inbox'
+import type { LaunchAgent } from './launch-agent'
+import { MAX_QLOO_CALLS } from './limits'
+import {
+  LISTENERS_PROFILING,
+  PROFILE_INTERRUPTED,
+  rowsOf,
+  toProfile,
+  tooFewToProfile,
+  type ListenerProfile
+} from './listeners'
+import {
+  byEntity,
+  closestCount,
+  closestOf,
+  entityKey,
+  isStale,
+  MIN_OVERLAP_ENTITIES,
+  OVERLAP_INTERRUPTED,
+  OVERLAP_MEASURING,
+  overlapCopy,
+  rosterEntities,
+  toMeasure,
+  tooFew,
+  type Entity,
+  type OverlapRow
+} from './overlap'
+import { Refusal } from './refusal'
+import { holdsSample } from './roster'
+import { sample, sampleCpm, sampleRoster, type Sample } from './sample'
+import { readSampleLaunches } from './sample-launches'
+import { GUEST_NETWORK, GUEST_NETWORK_CLEARS, GUEST_PREFIX, LOOKUP_RETRIED } from './text'
+
+// The header that names a connection's member. The Worker sets it on each upgrade it lets through to
+// a network's agent, once it has checked the session and the membership, replacing any the browser
+// sent; nothing else reaches the agent.
+export const MEMBER_HEADER = 'Crossfeed-Member'
+// And the header with their name, URI-encoded, for an agent to say who did what.
+export const MEMBER_NAME_HEADER = 'Crossfeed-Member-Name'
+
+// A connection's member tag, `member:<id>`, from the header the Worker set on its upgrade.
+export function memberTag({ request }: ConnectionContext) {
+  const member = request.headers.get(MEMBER_HEADER)
+  return member ? [`${MEMBER_TAG}${member}`] : []
+}
+
+// A launch's agent's name: its network's ID and its own; and the two read back.
+export const launchAgentName = (networkId: string, launchId: string) => `${networkId}:${launchId}`
+export function readLaunchAgentName(name: string) {
+  const [networkId, launchId] = name.split(':')
+  return { networkId, launchId }
+}
+
+// The network an agent belongs to, from its name: the network's ID for its own agent, and
+// `<networkId>:<launchId>` for a launch's.
+const networkOf = (name: string) => name.split(':')[0]
+
+// Whether a network counts on the guest budget every guest shares, from one of its agents'
+// names: its ID starts with `guest-`, as the guest network's and every network a guest member creates do.
+export const onGuestBudget = (name: string) => networkOf(name).startsWith(GUEST_PREFIX)
+
+// What a network's agents count against for the per-visitor limits: the network, or for one on the guest
+// budget, the guest network.
+export const networkLimitKey = (name: string) => `network:${onGuestBudget(name) ? GUEST_NETWORK : networkOf(name)}`
+
+// The name of a network's own gateway instance, from an agent's name: `network:<networkId>`,
+// each network's its own, though the guest budget's networks count their limits under one key. And the
+// instance, where the network's own Qloo key, its cache, and its Qloo counts live.
+export const ownGatewayName = (name: string) => `network:${networkOf(name)}`
+export const ownGateway = (env: Env, name: string) => env.QlooGateway.getByName(ownGatewayName(name))
+
+// Where a network's agent, and each of its launches', keeps whether the network has a Qloo key of its own,
+// as the network's settings last said (NetworkAgent.noteOwnKey), so no call asks its gateway instance
+// first and a network without a key never has an instance.
+const OWN_KEY = 'crossfeed_own_qloo_key'
+export const hasOwnKey = (storage: DurableObjectStorage) => storage.kv.get(OWN_KEY) === true
+export const keepOwnKey = (storage: DurableObjectStorage, set: boolean) => storage.kv.put(OWN_KEY, set)
+
+// The gateway a network's Qloo calls go through, and its launches': its own instance while it has a key
+// of its own, as the agent in `storage` knows, else the global one, as every other network's does.
+export const networkGateway = (env: Env, name: string, storage: DurableObjectStorage) =>
+  hasOwnKey(storage) ? ownGateway(env, name) : globalGateway(env)
+
+// Closes member `memberId`'s open pages of network `networkId` and its launches, once the directory has
+// let them go, saying `reason` if it isn't that they left the network, as when they're removed, sign
+// out everywhere, or delete their account.
+export const kickMember = async (env: Env, networkId: string, memberId: string, reason?: string) =>
+  (await getAgentByName(env.NetworkAgent, networkId)).kick(memberId, reason)
+
+// What the Worker passes a network's agent as it starts it to wipe it (wipe.ts): it's about to be thrown
+// away, so the guest network's loads no sample, which would reserve Qloo calls on the guest budget for
+// nothing.
+export const CLEARING = { clearing: true }
+
+// What a deleted launch's open pages say as they close, and a deleted network's, and its launches'; and
+// the guest network's, and its launches', as the daily cron clears it, or as an owner resets its sample
+// data from its settings, whether a guest or a member who owns it.
+export const LAUNCH_DELETED = 'This launch was deleted.'
+export const NETWORK_DELETED = 'This network was deleted.'
+export const GUEST_NETWORK_RESET = `The guest network was cleared, as it is every day at ${GUEST_NETWORK_CLEARS}.`
+export const SAMPLE_DATA_RESET = 'The guest network was reset to the sample data.'
+
+// The Qloo calls the guest network's start reserves on the guest budget to load the sample again, as after
+// its clearing or a reset, while the sample network is on: the sample roster's lookups (loadSample); then
+// its analyses' (analyseSample), counted at their most, a ranking per sample show and the listener
+// profile's one call, so it counts one more than they reserve for each show that doesn't resolve; and with
+// guest pitches on, the sample inbox's works' (loadSampleInbox).
+export const sampleLookups = (env: Env) =>
+  env.SAMPLE_NETWORK !== 'on'
+    ? 0
+    : sampleRoster.length +
+      (sampleRoster.length + 1) +
+      (env.GUEST_PITCHES === 'on' ? readSampleInbox().pitches.filter((p) => p.status === 'looking_up').length : 0)
+
+const LAUNCHES =
+  "A network's agent keeps the roster and the inbox; each launch runs in its own workspace, with its runs and insertion order."
+// Where a network's agent keeps the roster it last told its launches (rosterKey).
+const ANNOUNCED = 'crossfeed_roster_announced'
+// And the version of its launches' rows it has asked them for (askInventory): what each commits
+// of the roster's promo inventory. And how many it asks at once.
+const INVENTORY_ASKED = 'crossfeed_inventory_asked'
+const INVENTORY_VERSION = 1
+const INVENTORY_CONCURRENCY = 5
+// Where the guest network's agent keeps that it has loaded the sample network, and its sample launch's ID
+// once it has planned it (loadSample).
+const SAMPLE_LOADED = 'crossfeed_sample_loaded'
+const SAMPLE_LAUNCH = 'crossfeed_sample_launch'
+// And that it has loaded the sample inbox (loadSampleInbox).
+const SAMPLE_INBOX_LOADED = 'crossfeed_sample_inbox_loaded'
+// And that it has started the sample roster's analyses since it last started, whether or not they landed
+// (analyseSample).
+const SAMPLE_ANALYSES_STARTED = 'crossfeed_sample_analyses_started'
+// And that it has listed every one of the sample launches in D1 (loadSampleLaunches), and until then each
+// one's launch ID, by its key, and whether it's listed yet.
+const SAMPLE_LAUNCHES_LOADED = 'crossfeed_sample_launches_loaded'
+const SAMPLE_LAUNCHES_PROGRESS = 'crossfeed_sample_launches_progress'
+type SampleLaunchesProgress = Record<string, { id: string; listed: boolean }>
+
+// A sample pitch whose work's lookup failed, or was interrupted, so it's looked up again.
+const unsettled = (p: Pitch) => p.work !== null && (p.status === 'failed' || p.match?.resolution === 'failed')
+
+// Whether the roster's overlap has landed whole, every anchor's ranking in, and whether its listener profile
+// has landed, so the sample's analyses needn't ask for them again (NetworkAgent.sampleDue).
+const overlapLanded = ({ overlap }: State) => overlap?.status === 'measured' && overlap.rows.every((r) => !r.error)
+const profileLanded = ({ listenerProfile }: State) => listenerProfile?.status === 'profiled'
+
+// A pitch run's booking with no reply naming member `memberId` as its approver; each stays approved.
+const withoutApprover = (booking: Booking | null, memberId: string): Booking | null =>
+  booking?.replies
+    ? { ...booking, replies: booking.replies.map((r) => (r.approvedBy === memberId ? unnamed(r) : r)) }
+    : booking
+const unnamed = ({ approvedBy: _, ...reply }: PitchReply): PitchReply => reply
+
+// One of the roster's analyses, for the steps their starts share (NetworkAgent.reserveAnalysis): where the
+// network's state keeps it, its status while its calls are out, and its words in the refusals: what it's
+// called while it runs, what a member does to start it, and the start itself.
+type Analysis = {
+  kept: 'overlap' | 'listenerProfile'
+  running: string
+  busy: string
+  tooFew: (n: number) => string
+  todo: string
+  start: string
+}
+const OVERLAP: Analysis = {
+  kept: 'overlap',
+  running: 'measuring',
+  busy: OVERLAP_MEASURING,
+  tooFew,
+  todo: 'Measure the overlap',
+  start: 'the measure'
+}
+const LISTENER_PROFILE: Analysis = {
+  kept: 'listenerProfile',
+  running: 'profiling',
+  busy: LISTENERS_PROFILING,
+  tooFew: tooFewToProfile,
+  todo: 'Profile the listeners',
+  start: 'the profile'
+}
+
+// One instance per signed-in network, named by the network's ID. Its own class keeps its
+// namespace apart from engine sessions, so no session cookie can name it. It opens empty, but for
+// the guest network, which loads the sample network (loadSample), and every connection to it carries
+// its member.
+export class NetworkAgent extends CrossfeedAgent {
+  initialState: State = { ...this.initialState, launches: [], checklistDismissed: [] }
+
+  protected opensOnSample = false
+  protected keepsSettledShows = true
+
+  // The network's Qloo calls and model runs count together, as one visitor's would, whichever member
+  // makes them, and with no connection at all, as the Worker's own calls have.
+  protected limitKey() {
+    return networkLimitKey(this.name)
+  }
+
+  // An older agent was never told whether the network has a Qloo key of its own, which one
+  // saved then is kept in the network's gateway instance: it asks that instance once, as it next starts.
+  // A new network's agent knows it has none until its settings say otherwise, so it asks nothing. One
+  // that can't ask goes on without, and asks again as it next starts.
+  async onStart(props?: SessionProps & Partial<typeof CLEARING>) {
+    const { storage } = this.ctx
+    if (storage.kv.get(OWN_KEY) === undefined)
+      if (!this.startedBefore()) keepOwnKey(storage, false)
+      else
+        await ownGateway(this.env, this.name)
+          .ownKey()
+          .then(({ set }) => keepOwnKey(storage, set))
+          .catch((e) => console.error(JSON.stringify({ event: 'own_key_lookup', error: String(e) })))
+    // A sample inbox stopped while its works were looked up isn't a guest's to load again, as an inbox
+    // stopped reading is (CrossfeedAgent.onStart): its lookups are tried again (loadSampleInbox).
+    const inbox = this.state.inbox
+    if (inbox?.sample && inbox.status === 'reading') this.finishInbox(inbox.id, LOOKUP_RETRIED)
+    // A measure is kept alive while its calls are out, so one still measuring at startup lost them. The
+    // rows that landed stay, and measuring again asks only the rest.
+    const overlap = this.state.overlap
+    if (overlap?.status === 'measuring')
+      this.setState({ ...this.state, overlap: { ...overlap, status: 'failed', error: OVERLAP_INTERRUPTED } })
+    // A listener profile is kept alive while its call is out, too, so one still profiling lost it.
+    const profile = this.state.listenerProfile
+    if (profile?.status === 'profiling')
+      this.setState({
+        ...this.state,
+        listenerProfile: { ...profile, status: 'failed', error: PROFILE_INTERRUPTED }
+      })
+    await super.onStart(props)
+    if (!props?.clearing) this.askInventory()
+    if (this.name !== GUEST_NETWORK) return
+    if (this.env.SAMPLE_NETWORK === 'on' && !props?.clearing) {
+      await this.loadSample()
+      await this.loadSampleLaunches()
+      await this.loadSampleInbox()
+      // The sample roster's analyses that are due again (sampleDue) start now, or once its lookups settle, as
+      // do those the lookups this start tries again may change.
+      const { kv } = this.ctx.storage
+      const due = this.sampleDue(this.state)
+      if (!kv.get(SAMPLE_LOADED) || due.overlap || due.profile) kv.delete(SAMPLE_ANALYSES_STARTED)
+      this.sampleLoadsRan = true
+      this.analyseSample(this.state)
+    }
+    // The guest network starts with the sample network's CPM, until a guest, an owner, sets one,
+    // even when the sample roster couldn't load, and an import keeps it. One an older import left unset
+    // gets it back here.
+    if (this.state.cpm === null) this.setState({ ...this.state, cpm: sampleCpm })
+  }
+
+  // Asks each launch whose row was reported before rows said what it commits of the roster's promo
+  // inventory for its row as it now stands, in the background, a few at once, once per network: the
+  // version asked is noted in storage once every launch has answered, so a launch that fails to answer,
+  // or a restart before they all have, leaves it unnoted, and the next start asks those still without
+  // it. A launch is asked only while the list still holds it without them, so one deleted meanwhile isn't
+  // woken, and a row it reports itself meanwhile stays. Until it's asked, a row without them is one the
+  // Launches page counts as not reported.
+  private askInventory() {
+    const { kv } = this.ctx.storage
+    if (kv.get(INVENTORY_ASKED) === INVENTORY_VERSION) return
+    const unreported = (id: string) => {
+      const row = this.state.launches?.find((l) => l.id === id)
+      return row !== undefined && row.finalistShows === undefined
+    }
+    const queue = (this.state.launches ?? []).map((l) => l.id).filter(unreported)
+    let failed = false
+    const next = async () => {
+      for (let id = queue.shift(); id; id = queue.shift()) {
+        if (!unreported(id)) continue
+        try {
+          const summary = await (await getAgentByName(this.env.LaunchAgent, launchAgentName(this.name, id))).summary()
+          if (unreported(id)) this.reportLaunch(id, summary)
+        } catch (e) {
+          failed = true
+          console.error(JSON.stringify({ event: 'inventory_ask', launch: id, error: String(e) }))
+        }
+      }
+    }
+    void this.keepAliveWhile(async () => {
+      await Promise.all(Array.from({ length: INVENTORY_CONCURRENCY }, next))
+      if (!failed) kv.put(INVENTORY_ASKED, INVENTORY_VERSION)
+    })
+  }
+
+  // While the guest network's sample is still loading, each start looks up every failed lookup again
+  // (loadSample). So a lookup a restart interrupted then says Crossfeed tries it again.
+  protected interruptedLookup() {
+    const loading =
+      this.name === GUEST_NETWORK &&
+      this.env.SAMPLE_NETWORK === 'on' &&
+      !this.ctx.storage.kv.get(SAMPLE_LOADED) &&
+      holdsSample(this.state.roster)
+    return loading ? LOOKUP_RETRIED : super.interruptedLookup()
+  }
+
+  // Loads the sample network into the guest network on its first start, each day after the daily cron
+  // clears it: the sample CPM labelled as a sample figure, the sample launch planned, and the
+  // sample roster with its labels, looked up like an import. The CPM and the plan call nothing, so they
+  // land whatever the lookups do; the lookups count on the guest budget, and refused, the roster stays
+  // empty. Until it's noted as loaded, each start tries again what didn't land: a roster still empty, the
+  // lookups that failed, the launch if it wasn't planned. It's noted once a start finds the roster settled
+  // and the launch planned, or finds the sample replaced by a guest's import and edits, which leave no show
+  // holding a sample figure, though the CPM may still be the sample's. It runs before any page
+  // connects, so it plans the launch and reserves the calls here, and leaves the lookups to run in the
+  // background.
+  private async loadSample() {
+    const { kv } = this.ctx.storage
+    if (kv.get(SAMPLE_LOADED)) return
+    const { roster } = this.state
+    if (roster.length > 0 && !holdsSample(roster)) return kv.put(SAMPLE_LOADED, true)
+    const failed = (e: unknown) => console.error(JSON.stringify({ event: 'sample_load', error: String(e) }))
+    if (!this.state.sample) {
+      // A CPM a guest set before the sample loaded is theirs, so it stays, unlabelled.
+      const cpm = this.state.cpm ?? sampleCpm
+      this.setState({ ...this.state, cpm, sample: { ...sample, cpm: cpm === sampleCpm } })
+    }
+    let planned = kv.get(SAMPLE_LAUNCH) !== undefined
+    if (!planned)
+      try {
+        kv.put(SAMPLE_LAUNCH, (await this.planLaunch(sample.launch, this.state.sample)).id)
+        planned = true
+      } catch (e) {
+        failed(e)
+      }
+    const missing = roster.length === 0 ? sampleRoster.length : roster.filter((s) => s.resolution === 'failed').length
+    if (missing === 0) {
+      if (planned) kv.put(SAMPLE_LOADED, true)
+      return
+    }
+    try {
+      const gateway = await this.reserveCalls(this.limitKey(), missing)
+      if (roster.length > 0) this.lookUpRoster(roster, {}, gateway, [])
+      else this.lookUpRoster(sampleRoster, {}, gateway)
+    } catch (e) {
+      failed(e)
+    }
+  }
+
+  // Lists the sample launches beside The Watch (sample-launches.ts), each seeded in its own
+  // agent from the rows D1 holds, read in one query, calling neither Qloo nor Claude, and listed as a
+  // planned launch is (listLaunch), under an ID kept from the first try, so one tried again seeds and lists
+  // it once. Until every row is noted as listed, each start tries again those that weren't: refused by the
+  // launch cap, or failed. One a guest deletes once it's listed stays deleted. With no rows, as before an
+  // environment's are loaded, the guest network has The Watch alone, and each start reads the table again,
+  // so rows loaded since are listed as it next starts. Noted as loaded until the daily clearing.
+  private async loadSampleLaunches() {
+    const { kv } = this.ctx.storage
+    if (kv.get(SAMPLE_LAUNCHES_LOADED)) return
+    const failed = (e: unknown, key?: string) =>
+      console.error(JSON.stringify({ event: 'sample_launches_load', ...(key && { key }), error: String(e) }))
+    let launches
+    try {
+      launches = readSampleLaunches(await sampleLaunchRows(this.env.DB))
+    } catch (e) {
+      return failed(e)
+    }
+    const progress = kv.get<SampleLaunchesProgress>(SAMPLE_LAUNCHES_PROGRESS) ?? {}
+    for (const { key, run } of launches) {
+      if (progress[key]?.listed) continue
+      progress[key] = { id: progress[key]?.id ?? crypto.randomUUID(), listed: false }
+      kv.put(SAMPLE_LAUNCHES_PROGRESS, progress)
+      try {
+        await this.listLaunch(progress[key].id, (agent) => agent.seed(run))
+        progress[key].listed = true
+        kv.put(SAMPLE_LAUNCHES_PROGRESS, progress)
+      } catch (e) {
+        failed(e, key)
+      }
+    }
+    if (launches.length > 0 && launches.every(({ key }) => progress[key]?.listed)) kv.put(SAMPLE_LAUNCHES_LOADED, true)
+  }
+
+  // Loads the sample inbox into the guest network beside the sample network, while guest pitches are on:
+  // its show and past guests, and its pitches already read from their answer key, so no
+  // model is called and no model run counted. The works are looked up as the roster is, their calls
+  // reserved on the guest budget; the pitches with no work are set aside. Refused, the inbox stays empty.
+  // Until it's noted as loaded, each start tries again what didn't land: an inbox still empty, or the
+  // lookups that failed or were interrupted. It's noted once a start finds every lookup settled, a pitch
+  // run started on it, whose lists and replies name its pitches as they were then, or a guest's own
+  // pitches, which it never replaces.
+  private async loadSampleInbox() {
+    const { kv } = this.ctx.storage
+    if (kv.get(SAMPLE_INBOX_LOADED) || this.env.GUEST_PITCHES !== 'on') return
+    const current = this.state.inbox
+    if (current && (!current.sample || this.state.booking)) return kv.put(SAMPLE_INBOX_LOADED, true)
+    const inbox: Inbox = current
+      ? {
+          ...current,
+          status: 'reading',
+          pitches: current.pitches.map((p) =>
+            unsettled(p) ? { ...p, status: 'looking_up', match: null, error: null } : p
+          )
+        }
+      : { id: crypto.randomUUID(), status: 'reading', ...readSampleInbox() }
+    const missing = inbox.pitches.filter((p) => p.status === 'looking_up').length
+    if (missing === 0) return kv.put(SAMPLE_INBOX_LOADED, true)
+    try {
+      this.lookUpInbox(inbox, await this.reserveCalls(this.limitKey(), missing))
+    } catch (e) {
+      console.error(JSON.stringify({ event: 'sample_inbox_load', error: String(e) }))
+    }
+  }
+
+  // Measures the sample roster's overlap and profiles its listeners in the guest network, so a guest finds
+  // the roster page's Overlap and Listeners tabs filled: once a clearing, as the sample roster, in
+  // `state`, first has no lookup pending, noted in storage so no later change starts them again. Each is
+  // started as a member's page starts it, its calls reserved on the guest budget, which sampleLookups
+  // counts. A start clears the note while either is due again (onStart), so each start tries again what
+  // didn't land, once no lookup is pending: the rankings that failed or a restart interrupted, the
+  // profile's call, or either start that was refused; and while the sample is still loading, either the
+  // lookups it tries again have changed. Neither starts before this start's sample loads have run, nor
+  // once a guest's import leaves no sample figure, and a guest's roster edit leaves both stale for every
+  // guest, as any edit of the shared network does.
+  private analyseSample(state: State) {
+    const { kv } = this.ctx.storage
+    if (!this.sampleLoadsRan || kv.get(SAMPLE_ANALYSES_STARTED)) return
+    if (!holdsSample(state.roster) || state.roster.some((s) => s.resolution === 'pending')) return
+    kv.put(SAMPLE_ANALYSES_STARTED, true)
+    const due = this.sampleDue(state)
+    const start = (event: string, analyse: () => Promise<void>) =>
+      void this.keepAliveWhile(analyse).catch((e) => console.error(JSON.stringify({ event, error: String(e) })))
+    if (due.overlap) start('sample_overlap', () => this.measureOverlap())
+    if (due.profile) start('sample_listener_profile', () => this.profileListeners())
+  }
+
+  // Whether this start has run the guest network's sample loads (onStart), which a start to wipe it never
+  // does. Until then no state change starts the sample roster's analyses, such as a restart failing the
+  // lookups it interrupted before the load tries them again, since onStart starts them itself.
+  private sampleLoadsRan = false
+
+  // Which of the sample roster's analyses are due again (analyseSample): each that hasn't landed whole, and
+  // while the sample is still loading, its failed lookups tried again on each start, each the roster's
+  // matched shows have changed since it was made. Once it has loaded, a guest's edit makes neither due.
+  private sampleDue(state: State) {
+    const loading = !this.ctx.storage.kv.get(SAMPLE_LOADED)
+    const stale = (analysis?: { key: string }) => loading && analysis !== undefined && isStale(analysis, state.roster)
+    return {
+      overlap: !overlapLanded(state) || stale(state.overlap),
+      profile: !profileLanded(state) || stale(state.listenerProfile)
+    }
+  }
+
+  // Measures the roster's overlap (overlap.ts), from a member's page or a program: one ranking in Qloo
+  // per distinct entity the roster's shows are matched or mapped to, that entity the only anchor and the
+  // others the candidates. It needs four such entities, no lookup still pending, and no measure already
+  // running. With the roster's entities unchanged since the last measure, it asks only the anchors whose
+  // ranking hasn't landed, and with none left, nothing. It reserves one call per anchor on the network's
+  // daily calls, and is refused, too, when the gateway's requests left today couldn't take them and still
+  // leave a run's. It returns once the calls are out, since 50 of them take about the client's 30-second
+  // call timeout, and each anchor's row lands as its call answers.
+  @callable()
+  async measureOverlap() {
+    const started = await this.reserveAnalysis(OVERLAP, () => {
+      const measure = toMeasure(this.state.roster, this.state.overlap)
+      return { ...measure, calls: measure.anchors.length }
+    })
+    if (!started) return
+    const { entities, key, anchors, gateway } = started
+    // A ranking that failed is asked again, so only the rows that landed stay, and only for these entities.
+    const prior = this.state.overlap?.key === key ? this.state.overlap : null
+    // Numbered now, in entity order, so the calls' numbers follow the anchors'.
+    const seqs = anchors.map(() => this.numberCall())
+    this.setState({
+      ...this.state,
+      overlap: {
+        status: 'measuring',
+        error: null,
+        key,
+        asked: anchors.length,
+        answered: 0,
+        measuredAt: prior?.measuredAt ?? null,
+        rows: prior?.rows.filter((r) => !r.error) ?? []
+      }
+    })
+    // All at once: the gateway paces, limits, and retries the calls. Anything that breaks outside an
+    // anchor's own call, such as landing its row, fails the measure, so it can't stay measuring.
+    const k = closestCount(entities.length)
+    void this.keepAliveWhile(() =>
+      Promise.all(anchors.map((anchor, i) => this.rankAnchor(anchor, entities, k, seqs[i], gateway)))
+    ).catch((e) => {
+      const error = `Measuring the overlap failed: ${e instanceof Error ? e.message : String(e)}`
+      console.error(JSON.stringify({ event: 'overlap_measure', error }))
+      const overlap = this.state.overlap
+      if (overlap?.status === 'measuring')
+        this.setState({ ...this.state, overlap: { ...overlap, status: 'failed', error } })
+    })
+  }
+
+  // The steps that start each of the roster's analyses, the overlap's measure and the listener profile.
+  // It needs no lookup still pending, and none of `analysis` running or still reserving its calls, so two
+  // starts at once reserve once; then at least MIN_OVERLAP_ENTITIES distinct entities. `ask` says what it
+  // would ask Qloo now, from the roster's entities: with no call, nothing, and it returns null. Otherwise
+  // it reserves the calls on the network's daily calls, refused, too, when the gateway's requests left
+  // today couldn't take them and still leave a run's, then checks the roster again, as an import may have
+  // started meanwhile, and returns what it asks with the gateway that reserved the calls, which makes them.
+  private async reserveAnalysis<T extends { entities: Entity[]; key: string; calls: number }>(
+    analysis: Analysis,
+    ask: () => T
+  ): Promise<(T & { gateway: DurableObjectStub<QlooGateway> }) | null> {
+    const ready = () => {
+      const pending = this.state.roster.filter((s) => s.resolution === 'pending').length
+      if (pending > 0)
+        throw new Refusal(
+          'conflict',
+          `The roster is still looking up ${pending === 1 ? '1 show' : `${pending} shows`} in Qloo. ${analysis.todo} once the lookups have settled.`
+        )
+      if (this.state[analysis.kept]?.status === analysis.running) throw new Refusal('conflict', analysis.busy)
+    }
+    ready()
+    // A start still reserving its calls is running too, so two starts at once reserve once.
+    if (this.reserving.has(analysis.kept)) throw new Refusal('conflict', analysis.busy)
+    const asked = ask()
+    if (asked.entities.length < MIN_OVERLAP_ENTITIES)
+      throw new Refusal('conflict', analysis.tooFew(asked.entities.length))
+    if (asked.calls === 0) return null
+    this.reserving.add(analysis.kept)
+    let gateway: DurableObjectStub<QlooGateway>
+    try {
+      gateway = await this.reserveCalls(this.limitKey(), asked.calls, MAX_QLOO_CALLS)
+    } finally {
+      this.reserving.delete(analysis.kept)
+    }
+    ready() // again, since an import may have started meanwhile
+    if (entityKey(rosterEntities(this.state.roster)) !== asked.key)
+      throw new Refusal(
+        'conflict',
+        `The roster's matched shows changed as ${analysis.start} started, so it didn't. ${analysis.todo} again.`
+      )
+    return { ...asked, gateway }
+  }
+
+  // The analyses whose start is reserving its calls (reserveAnalysis).
+  private reserving = new Set<Analysis['kept']>()
+
+  // Ranks the other entities against one anchor through `reserved`, where its call was reserved, and lands
+  // its row: its top `k`, or why the ranking failed.
+  private async rankAnchor(
+    anchor: Entity,
+    entities: Entity[],
+    k: number,
+    seq: number,
+    reserved: DurableObjectStub<QlooGateway>
+  ) {
+    const candidates = entities.filter((e) => e.id !== anchor.id).map((e) => e.id)
+    let row: OverlapRow
+    try {
+      const { call, result } = await this.qloo(
+        (gateway) => gateway.rank([anchor.id], candidates, 'urn:entity:podcast'),
+        null,
+        seq,
+        reserved
+      )
+      row = result.ok
+        ? { entity: anchor, call, closest: closestOf(result.data.scored, k), error: null }
+        : { entity: anchor, call, closest: [], error: result.error }
+    } catch (e) {
+      // Anything else that breaks still lands the row, so the measure can't stay measuring.
+      const error = `The ranking failed: ${e instanceof Error ? e.message : String(e)}`
+      row = { entity: anchor, call: callNumber(seq), closest: [], error }
+    }
+    this.landOverlapRow(row)
+  }
+
+  // Lands an anchor's row, unless its entity has left the roster since the measure started, and ends the
+  // measure with its last answer: measured, or failed when no anchor's ranking has landed.
+  private landOverlapRow(row: OverlapRow) {
+    const overlap = this.state.overlap
+    if (overlap?.status !== 'measuring') return
+    const onRoster = rosterEntities(this.state.roster).some((e) => e.id === row.entity.id)
+    const rows = [...overlap.rows.filter((r) => r.entity.id !== row.entity.id), ...(onRoster ? [row] : [])].sort(
+      byEntity
+    )
+    const answered = overlap.answered + 1
+    const ended =
+      answered < overlap.asked
+        ? {}
+        : rows.some((r) => !r.error)
+          ? { status: 'measured' as const, measuredAt: new Date().toISOString() }
+          : {
+              status: 'failed' as const,
+              error: "No show's ranking landed, as each show's row says. Measure the overlap again."
+            }
+    this.setState({ ...this.state, overlap: { ...overlap, rows, answered, ...ended } })
+  }
+
+  // Profiles the roster's listeners (listeners.ts), from a member's page or a program: one demographics
+  // call in Qloo with every distinct entity the roster's shows are matched or mapped to. It's started,
+  // reserved, refused and checked again as a measure of the overlap is (reserveAnalysis), and with the
+  // roster's entities unchanged since a profile that landed, it asks nothing. It returns once the call is
+  // out, and the profile lands as it answers.
+  @callable()
+  async profileListeners() {
+    const started = await this.reserveAnalysis(LISTENER_PROFILE, () =>
+      toProfile(this.state.roster, this.state.listenerProfile)
+    )
+    if (!started) return
+    const { entities, key, gateway } = started
+    const seq = this.numberCall()
+    this.setState({
+      ...this.state,
+      listenerProfile: { status: 'profiling', error: null, key, call: null, profiledAt: null, rows: [] }
+    })
+    // Anything that breaks outside the call itself, such as landing it, fails the profile, so it can't stay
+    // profiling.
+    void this.keepAliveWhile(() => this.profileEntities(entities, seq, gateway)).catch((e) => {
+      const error = `Profiling the listeners failed: ${e instanceof Error ? e.message : String(e)}`
+      console.error(JSON.stringify({ event: 'listener_profile', error }))
+      const profile = this.state.listenerProfile
+      if (profile?.status === 'profiling')
+        this.setState({ ...this.state, listenerProfile: { ...profile, status: 'failed', error } })
+    })
+  }
+
+  // Asks Qloo for the listeners of `entities` through `reserved`, where its call was reserved, and lands
+  // the profile: each entity's row still on the roster, those Qloo has no profile for among them, or why
+  // the call failed.
+  private async profileEntities(entities: Entity[], seq: number, reserved: DurableObjectStub<QlooGateway>) {
+    let landed: Pick<ListenerProfile, 'call' | 'error' | 'rows'>
+    try {
+      const { call, result } = await this.qloo((gateway) => gateway.demographics(entities), null, seq, reserved)
+      landed = result.ok
+        ? { call, error: null, rows: rowsOf(entities, result.data) }
+        : { call, error: result.error, rows: [] }
+    } catch (e) {
+      // Anything else that breaks still lands the profile, failed, so it can't stay profiling.
+      landed = {
+        call: callNumber(seq),
+        error: `The demographics call failed: ${e instanceof Error ? e.message : String(e)}`,
+        rows: []
+      }
+    }
+    const profile = this.state.listenerProfile
+    if (profile?.status !== 'profiling') return
+    const onRoster = new Set(rosterEntities(this.state.roster).map((e) => e.id))
+    this.setState({
+      ...this.state,
+      listenerProfile: {
+        ...profile,
+        ...landed,
+        rows: landed.rows.filter((r) => onRoster.has(r.entity.id)),
+        ...(landed.error
+          ? { status: 'failed' as const }
+          : { status: 'profiled' as const, profiledAt: new Date().toISOString() })
+      }
+    })
+  }
+
+  // Its Qloo calls go through its own gateway instance while it has a Qloo key of its own.
+  protected async gateway() {
+    return networkGateway(this.env, this.name, this.ctx.storage)
+  }
+
+  // Whether the network has a Qloo key of its own, for its settings and usage. Over RPC only.
+  hasOwnKey() {
+    return hasOwnKey(this.ctx.storage)
+  }
+
+  // Notes whether the network has a Qloo key of its own, as an owner adds or removes it in settings, and
+  // tells each launch, so a run under way sends its next call through the right gateway. A launch the
+  // notice fails to reach learns it as its next run copies the roster. Over RPC only.
+  async noteOwnKey(set: boolean) {
+    keepOwnKey(this.ctx.storage, set)
+    await Promise.all(
+      (this.state.launches ?? []).map(async ({ id }) => {
+        try {
+          await (await getAgentByName(this.env.LaunchAgent, launchAgentName(this.name, id))).noteOwnKey(set)
+        } catch (e) {
+          console.error(JSON.stringify({ event: 'own_key_notice', launch: id, error: String(e) }))
+        }
+      })
+    )
+  }
+
+  // Tags a connection with its member, beside its visitor.
+  async getConnectionTags(connection: Connection, context: ConnectionContext) {
+    return [...(await super.getConnectionTags(connection, context)), ...memberTag(context)]
+  }
+
+  // After a change to the roster, once no show is still being looked up, tells each launch how it now
+  // stands, so a launch's page says when it has changed since that launch's latest run. Other changes
+  // to the network's state send nothing. What was sent is kept in storage, so waking up sends nothing
+  // new; a notice that fails forgets it, so the next change of any kind sends it again. In the guest
+  // network, the first such state after the sample roster loads starts its analyses too (analyseSample).
+  onStateChanged(state: State) {
+    if (state.roster.some((s) => s.resolution === 'pending')) return
+    this.analyseSample(state)
+    const key = rosterKey(state.roster)
+    const { kv } = this.ctx.storage
+    if (key === kv.get(ANNOUNCED)) return
+    kv.put(ANNOUNCED, key)
+    void this.keepAliveWhile(() =>
+      Promise.all(
+        (state.launches ?? []).map(async ({ id }) => {
+          try {
+            const launch = await getAgentByName(this.env.LaunchAgent, launchAgentName(this.name, id))
+            await launch.noteNetworkRoster(key)
+          } catch (e) {
+            kv.delete(ANNOUNCED)
+            console.error(JSON.stringify({ event: 'roster_notice', launch: id, error: String(e) }))
+          }
+        })
+      )
+    )
+  }
+
+  // Lets go of the network as its deletion, or the guest network's daily reset, wipes it (wipe.ts): its
+  // open pages close for good, saying `reason`, so none plans another launch, and it returns the
+  // launches it lists, to be wiped with it. Over RPC only.
+  letGo(reason = NETWORK_DELETED) {
+    for (const connection of this.getConnections()) connection.close(4410, reason)
+    return (this.state.launches ?? []).map((l) => l.id)
+  }
+
+  // Closes the member's connections to the network's agent and to each of its launches'.
+  async kick(memberId: string, reason?: string) {
+    super.kick(memberId, reason)
+    await Promise.all(
+      (this.state.launches ?? []).map(async ({ id }) =>
+        (await getAgentByName(this.env.LaunchAgent, launchAgentName(this.name, id))).kick(memberId, reason)
+      )
+    )
+  }
+
+  // Forgets member `memberId`, as their account's deletion does (wipe.ts): the replies they approved stay
+  // approved but no longer name them, and they leave the members who dismissed the setup checklist. Then
+  // each of its launches forgets their name, and the network lists each launch's row as it then stands,
+  // so the Launches page follows at once; then its runs' records forget them, last, so a pitch run that ended
+  // meanwhile, copying the rows as they stood, is caught. Over RPC only.
+  async forgetMember(memberId: string) {
+    const { booking, checklistDismissed: dismissed = [] } = this.state
+    if (booking?.replies?.some((r) => r.approvedBy === memberId) || dismissed.includes(memberId))
+      this.setState({
+        ...this.state,
+        booking: withoutApprover(booking, memberId),
+        checklistDismissed: dismissed.filter((m) => m !== memberId)
+      })
+    const rows = await Promise.all(
+      (this.state.launches ?? []).map(async ({ id }) => ({
+        id,
+        summary: await (
+          await getAgentByName(this.env.LaunchAgent, launchAgentName(this.name, id))
+        ).forgetMember(memberId)
+      }))
+    )
+    for (const { id, summary } of rows) this.reportLaunch(id, summary)
+    this.forgetInRuns(memberId)
+  }
+
+  // Forgets member `memberId` in each run's record, as their account's deletion does: the replies they
+  // approved no longer name them. A record is the whole state the run ended with (end() in agent.ts), so
+  // it also kept the network's launches and checklist, whose rows name who started each launch's last run
+  // with no ID to match; nothing reads them from a record, so they go. Parsed rather than rewritten in SQL
+  // as renameApprover does, since the approver sits in each reply of an array.
+  private forgetInRuns(memberId: string) {
+    for (const { id, snapshot } of this.sql<{ id: string; snapshot: string }>`SELECT id, snapshot FROM runs
+      WHERE json_type(snapshot, '$.launches') IS NOT NULL OR json_type(snapshot, '$.checklistDismissed') IS NOT NULL
+        OR instr(snapshot, ${memberId}) > 0`) {
+      const { launches: _, checklistDismissed: __, ...kept } = JSON.parse(snapshot) as RunSnapshot
+      const forgotten = { ...kept, booking: withoutApprover(kept.booking, memberId) }
+      this.sql`UPDATE runs SET snapshot = ${JSON.stringify(forgotten)} WHERE id = ${id}`
+    }
+  }
+
+  // Plans a new launch, named or from up to three comps: its own agent takes it, then it joins the
+  // network's list, newest first, where every member's Launches page shows it. Its page is at its ID. A
+  // network keeps at most LAUNCHES_PER_NETWORK launches; deleting one makes room. Launches still being
+  // planned count, since several can be planned at once while their agents take them.
+  @callable()
+  async createLaunch(input: LaunchInput) {
+    return this.planLaunch(input, null)
+  }
+
+  // Plans a launch as createLaunch does, carrying `sample` for the guest network's sample launch.
+  private async planLaunch(input: LaunchInput, sample: Sample | null) {
+    const { name, comps } = readLaunch(input, 'to plan it')
+    return this.listLaunch(crypto.randomUUID(), (launch) => launch.plan({ name, comps: comps ?? [], sample }))
+  }
+
+  // Lists launch `id` once its own agent has taken it, with `take`, which returns its row: planned, or
+  // seeded as one of the sample launches. A launch already listed stays as it is.
+  private async listLaunch(
+    id: string,
+    take: (launch: DurableObjectStub<LaunchAgent>) => Promise<Omit<LaunchSummary, 'id'>>
+  ) {
+    if (this.listsLaunch(id)) return { id }
+    const cap = Number(this.env.LAUNCHES_PER_NETWORK) || 0
+    if ((this.state.launches ?? []).length + this.planning >= cap)
+      throw new Refusal(
+        'limit',
+        `A network keeps at most ${cap === 1 ? '1 launch' : `${cap} launches`} at once. Delete one it no longer needs, on the Launches page, to plan another.`
+      )
+    this.planning++
+    try {
+      const launch = await getAgentByName(this.env.LaunchAgent, launchAgentName(this.name, id))
+      const summary: LaunchSummary = { id, ...(await take(launch)) }
+      this.setState({ ...this.state, launches: [summary, ...(this.state.launches ?? [])] })
+      return { id }
+    } finally {
+      this.planning--
+    }
+  }
+
+  // How many launches createLaunch is planning right now, not yet on the list.
+  private planning = 0
+
+  // The roster and CPM a run of launch `id` starts from, with whether the CPM is labelled the sample's,
+  // the evidence records the roster cites, the roster's last completed overlap without its records, which
+  // the run copies as it drafts its order, whether the network has a Qloo key of its own, and the sample
+  // for the guest network's sample launch, for the launch's agent to copy (launch-agent.ts). Over RPC
+  // only. Comp searches stay here, since a launch never edits a show. Refused for a launch the list no
+  // longer has, and while a show is still being looked up, so no run ranks a roster half looked up.
+  rosterForLaunch(id: string): RosterCopy {
+    // A launch off the list runs no more, as when the daily clearing has taken it off and left its agent,
+    // and a page of it still open, for the hourly retry to wipe (wipe.ts).
+    if (!this.listsLaunch(id))
+      throw new Refusal(
+        'not_found',
+        "This launch was deleted, or its network cleared, so it can't run. Open the Launches page to see the network's launches."
+      )
+    const pending = this.state.roster.filter((s) => s.resolution === 'pending').length
+    if (pending > 0)
+      throw new Refusal(
+        'conflict',
+        `The network's roster is still looking up ${pending === 1 ? '1 show' : `${pending} shows`} in Qloo. Start the run once the lookups have settled, so it ranks every show.`
+      )
+    const roster = this.state.roster.map((s) => ({ ...s, compSearch: null }))
+    // Only the records the roster cites are read, since measuring the overlap takes the whole log past a
+    // megabyte.
+    const cited = new Set(JSON.stringify(roster).match(CALL))
+    return {
+      roster,
+      cpm: this.state.cpm,
+      sampleCpm: this.state.sample?.cpm ?? false,
+      evidence: this.getEvidence([...cited]),
+      overlap: overlapCopy(this.state.overlap),
+      ownKey: hasOwnKey(this.ctx.storage),
+      sample: id === this.ctx.storage.kv.get(SAMPLE_LAUNCH) ? this.state.sample : null
+    }
+  }
+
+  // A launch's status and summary, as its agent reports them after each change (launch-agent.ts), for
+  // its row on every member's Launches page. Over RPC only. A launch no longer on the list stays off it.
+  reportLaunch(id: string, summary: Omit<LaunchSummary, 'id'>) {
+    const launches = this.state.launches ?? []
+    if (!launches.some((l) => l.id === id)) return
+    this.setState({ ...this.state, launches: launches.map((l) => (l.id === id ? { id, ...summary } : l)) })
+  }
+
+  // Takes launch `id` off the network's list, as its deletion does before wiping it (wipe.ts): its row
+  // leaves every member's Launches page, and the Worker's routes to it answer 404. Over RPC only.
+  dropLaunch(id: string) {
+    const launches = this.state.launches ?? []
+    if (launches.some((l) => l.id === id))
+      this.setState({ ...this.state, launches: launches.filter((l) => l.id !== id) })
+  }
+
+  // Whether the network's list has launch `id`, for the Worker's routes to it. Over RPC only.
+  listsLaunch(id: string) {
+    return (this.state.launches ?? []).some((l) => l.id === id)
+  }
+
+  // Launches run in agents of their own, so a network's agent refuses what only a launch
+  // does. As it never runs a launch, `answer` and `getRun` only ever reach its inbox's pitch runs.
+  @callable()
+  startLaunch(): never {
+    throw new Error(LAUNCHES)
+  }
+
+  @callable()
+  editInsertionOrder(): never {
+    throw new Error(LAUNCHES)
+  }
+
+  @callable()
+  approveInsertionOrder(): never {
+    throw new Error(LAUNCHES)
+  }
+
+  // The CPM is an owner's to change, in settings: the Worker checks the role and calls this over RPC.
+  // The agent doesn't know members' roles, so a page's own connection is refused with why.
+  @callable()
+  setCpm(cpm: number) {
+    if (getCurrentAgent().connection) throw new Error("The CPM is changed in the network's settings, by an owner.")
+    super.setCpm(cpm)
+  }
+
+  // A reply is a member's to approve, in the app: a connection the Worker let through names
+  // its member, so one that names none, and any call with no connection, is refused.
+  @callable()
+  approveReply(pitchId: string) {
+    if (!this.member()) throw new Error('Only a member of the network, signed in to the app, can approve a reply.')
+    super.approveReply(pitchId)
+  }
+
+  // Hides the dashboard's setup checklist for the member on this connection, and no one else.
+  @callable()
+  dismissChecklist() {
+    const member = this.member()
+    if (!member) throw new Error('Only a member can dismiss the setup checklist.')
+    const dismissed = this.state.checklistDismissed ?? []
+    if (!dismissed.includes(member)) this.setState({ ...this.state, checklistDismissed: [...dismissed, member] })
+  }
+}

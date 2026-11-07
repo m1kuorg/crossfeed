@@ -23,7 +23,7 @@
       }
     },
     "repository": {
-      "url": "https://github.com/m1kuorg/qloo",
+      "url": "https://github.com/m1kuorg/crossfeed",
       "provider": "github",
       "link_mode": "web",
       "revision": "2a9eb4826925f470d5586fda42a5c514fb697528"
@@ -39,13 +39,13 @@
       "size": [170, 64],
       "sources": [
         {
-          "path": "apps/src/client/main.tsx",
+          "path": "apps/web/src/client/main.tsx",
           "line": 1,
           "end_line": 141,
           "label": "the island's pages"
         },
         {
-          "path": "apps/src/routes/app.tsx",
+          "path": "apps/web/src/routes/app.tsx",
           "line": 790,
           "end_line": 790,
           "label": "its agent's path"
@@ -61,13 +61,13 @@
       "size": [170, 64],
       "sources": [
         {
-          "path": "packages/sdk/src/index.ts",
+          "path": "apps/sdk/src/index.ts",
           "line": 118,
           "end_line": 130,
           "label": "the Crossfeed client"
         },
         {
-          "path": "apps/src/routes/api.ts",
+          "path": "apps/web/src/routes/api.ts",
           "line": 65,
           "end_line": 80,
           "label": "/api/v1, API key"
@@ -83,13 +83,13 @@
       "size": [170, 64],
       "sources": [
         {
-          "path": "plugins/crossfeed/.mcp.json",
+          "path": "apps/plugin/.mcp.json",
           "line": 1,
           "end_line": 9,
           "label": "the plugin's MCP server"
         },
         {
-          "path": "apps/src/routes/mcp.ts",
+          "path": "apps/web/src/routes/mcp.ts",
           "line": 825,
           "end_line": 840,
           "label": "/mcp"
@@ -105,13 +105,13 @@
       "size": [170, 64],
       "sources": [
         {
-          "path": "apps/wrangler.jsonc",
+          "path": "apps/web/wrangler.jsonc",
           "line": 11,
           "end_line": 11,
           "label": "the two crons"
         },
         {
-          "path": "apps/src/index.tsx",
+          "path": "apps/web/src/index.tsx",
           "line": 64,
           "end_line": 84,
           "label": "scheduled"
@@ -127,13 +127,13 @@
       "size": [170, 304],
       "sources": [
         {
-          "path": "apps/src/index.tsx",
+          "path": "apps/web/src/index.tsx",
           "line": 1,
           "end_line": 59,
           "label": "one app, a module per surface"
         },
         {
-          "path": "apps/src/routes/app.tsx",
+          "path": "apps/web/src/routes/app.tsx",
           "line": 808,
           "end_line": 830,
           "label": "agent connections"
@@ -149,13 +149,13 @@
       "size": [190, 64],
       "sources": [
         {
-          "path": "apps/src/directory.ts",
+          "path": "apps/web/src/directory.ts",
           "line": 1,
           "end_line": 4,
           "label": "the only code that reads it"
         },
         {
-          "path": "apps/wrangler.jsonc",
+          "path": "apps/web/wrangler.jsonc",
           "line": 70,
           "end_line": 77,
           "label": "DB"
@@ -171,7 +171,7 @@
       "size": [180, 64],
       "sources": [
         {
-          "path": "apps/src/network-agent.ts",
+          "path": "apps/web/src/network-agent.ts",
           "line": 202,
           "end_line": 210,
           "label": "NetworkAgent"
@@ -187,7 +187,7 @@
       "size": [180, 64],
       "sources": [
         {
-          "path": "apps/src/launch-agent.ts",
+          "path": "apps/web/src/launch-agent.ts",
           "line": 45,
           "end_line": 55,
           "label": "LaunchAgent"
@@ -203,13 +203,13 @@
       "size": [180, 64],
       "sources": [
         {
-          "path": "apps/src/gateway.ts",
+          "path": "apps/web/src/gateway.ts",
           "line": 122,
           "end_line": 130,
           "label": "QlooGateway"
         },
         {
-          "path": "apps/src/gateway.ts",
+          "path": "apps/web/src/gateway.ts",
           "line": 685,
           "end_line": 690,
           "label": "the call to Qloo"
@@ -225,13 +225,13 @@
       "size": [180, 64],
       "sources": [
         {
-          "path": "apps/src/claude.ts",
+          "path": "apps/web/src/claude.ts",
           "line": 1,
           "end_line": 30,
           "label": "the model and one turn"
         },
         {
-          "path": "apps/src/agent.ts",
+          "path": "apps/web/src/agent.ts",
           "line": 1532,
           "end_line": 1532,
           "label": "the agent's loop"
@@ -247,7 +247,7 @@
       "size": [180, 64],
       "sources": [
         {
-          "path": "apps/wrangler.jsonc",
+          "path": "apps/web/wrangler.jsonc",
           "line": 13,
           "end_line": 13,
           "label": "QLOO_BASE_URL"

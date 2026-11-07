@@ -1,0 +1,159 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crossfeed",
+  "account_id": "f0621d6622ac79af0e8e6f3520f78063",
+  "compatibility_date": "2026-10-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "./src/index.tsx",
+  "observability": { "enabled": true },
+  // The hourly cron, every hour but 12:00 UTC, and the daily one, which clears the directory as the hourly
+  // one does but leaves its retry of wipes to the next hour (src/index.tsx). The preview inherits both.
+  "triggers": { "crons": ["0 0-11,13-23 * * *", "0 12 * * *"] },
+  "vars": {
+    "QLOO_BASE_URL": "https://hackathon.api.qloo.com",
+    "QLOO_DAILY_CALL_CAP": "1000",
+    // Qloo calls one visitor's sessions make in a UTC day, cache hits included: each keeps an evidence
+    // record, so this bounds the storage a visitor can fill. A judge's whole path took 91.
+    "QLOO_VISITOR_DAILY_CALL_CAP": "2000",
+    "QLOO_TIMEOUT_MS": "20000",
+    "QLOO_RETRY_DELAYS_MS": "1000,3000",
+    "QLOO_MIN_INTERVAL_MS": "400",
+    // A call still waiting this long is shown as slow: the worst case per Qloo call.
+    "QLOO_SLOW_MS": "8000",
+    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+    // Model runs a day (UTC): per visitor, across sessions, and across all visitors. They bound model spend.
+    "RUN_VISITOR_DAILY_CAP": "10",
+    "RUN_DAILY_CAP": "200",
+    // Starts a visitor makes in a UTC day that call no model: replays, and runs that stop at once. They
+    // cost no spend, but each keeps a run, so this bounds the storage a visitor can fill.
+    "FREE_START_DAILY_CAP": "100",
+    // "on" opens accounts and everything behind them; "off" hides them all again at once. On since the
+    // product passed on the preview deployment. Tests turn it on.
+    "ACCOUNTS": "on",
+    // "on" shows the guest pitch flow; "off" hides it. On since its live check.
+    "GUEST_PITCHES": "on",
+    // The guest network loads the sample network each day; tests turn it off.
+    "SAMPLE_NETWORK": "on",
+    // "on" lets search engines index the public pages (routes/crawlers.ts). Production's alone: the
+    // preview leaves it out, so nothing there is indexed, and tests turn it off.
+    "SEARCH_INDEXING": "on",
+    // The passkey relying party's ID, and the origins (comma-separated) a member's browser may send
+    // from: each environment's own host, never read from the request.
+    "RP_ID": "crossfeed.m1kuorg.workers.dev",
+    "APP_ORIGINS": "https://crossfeed.m1kuorg.workers.dev",
+    // Sign-ups one visitor makes in a UTC day, joining through an invite aside, the networks one member
+    // can create, and the launches one network can keep at once. Invite links stand outside the
+    // sign-up cap, so a network keeps a number open at once, and one member's links bring in a number
+    // of new accounts a UTC day. Each API key has its own rate limit, so a network keeps a number of
+    // keys in use at once, or more keys would raise its requests a minute.
+    "SIGNUP_VISITOR_DAILY_CAP": "5",
+    "NETWORKS_PER_MEMBER": "3",
+    "LAUNCHES_PER_NETWORK": "100",
+    "INVITES_PER_NETWORK": "20",
+    "API_KEYS_PER_NETWORK": "10",
+    "INVITED_SIGNUP_DAILY_CAP": "20",
+    // Guest sign-ins a minute and a UTC day, for everyone at once, from any address or none:
+    // counted exactly in the D1 directory's log of them as each guest member is written, not per
+    // Cloudflare location. A day's keeps the guest members it adds inside D1's free daily writes.
+    "GUEST_SIGNINS_PER_MINUTE": "30",
+    "GUEST_SIGNINS_PER_DAY": "1000",
+    // Resets of the guest network's sample data from its settings a UTC day, for everyone at once, besides
+    // one a minute: counted exactly in the D1 directory as each is taken. Each reloads the sample on
+    // the guest budget, and leaves its launches' wipes to the hourly retry.
+    "SAMPLE_RESETS_PER_DAY": "20"
+  },
+  // VISITOR_SALT salts the hash of a visitor's IP address that keys their model run count.
+  // QLOO_KEY_SECRET encrypts each network's own Qloo key in its gateway instance.
+  "secrets": { "required": ["QLOO_API_KEY", "ANTHROPIC_API_KEY", "VISITOR_SALT", "QLOO_KEY_SECRET"] },
+  // The directory: members, passkeys, sessions, networks, and API keys. Its migrations
+  // are applied before each deploy, and by test/session.ts before each test.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "crossfeed",
+      "database_id": "8c6c6a5e-3f49-46f5-a5d1-32adb53f0cba",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CrossfeedAgent", "class_name": "CrossfeedAgent" },
+      { "name": "QlooGateway", "class_name": "QlooGateway" },
+      { "name": "NetworkAgent", "class_name": "NetworkAgent" },
+      { "name": "LaunchAgent", "class_name": "LaunchAgent" }
+    ]
+  },
+  // Requests a minute: per API key on /api/v1, on top of the network's daily caps, and per visitor on
+  // the auth routes that write a challenge or a session before anyone is signed in. And the API
+  // keys and invite links one member creates a minute, together, across their networks: the caps
+  // count only those in use or open, so a loop that revokes each as it goes is slowed by this alone. The
+  // namespace IDs are the account's own, one per limit and environment.
+  "ratelimits": [
+    { "name": "API_LIMITER", "namespace_id": "1671", "simple": { "limit": 120, "period": 60 } },
+    { "name": "AUTH_LIMITER", "namespace_id": "1672", "simple": { "limit": 20, "period": 60 } },
+    { "name": "CREATE_LIMITER", "namespace_id": "1675", "simple": { "limit": 30, "period": 60 } }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["CrossfeedAgent", "QlooGateway"] },
+    { "tag": "v2", "new_sqlite_classes": ["NetworkAgent", "LaunchAgent"] }
+  ],
+  "env": {
+    // The Worker crossfeed-preview, for checking the product on real Workers before production, with
+    // its own D1 database, Durable Objects, and secrets. Wrangler doesn't inherit vars, secrets, D1,
+    // Durable Object, or rate limit bindings, so each is repeated here: keep vars and limits in step
+    // with the top level's, apart from the host in RP_ID and APP_ORIGINS, ACCOUNTS, on here to check
+    // the product, SEARCH_INDEXING, left out here so search engines index nothing, and the rate limits'
+    // namespace IDs. Deploy it only with `bun run deploy:preview`.
+    "preview": {
+      "vars": {
+        "QLOO_BASE_URL": "https://hackathon.api.qloo.com",
+        "QLOO_DAILY_CALL_CAP": "1000",
+        "QLOO_VISITOR_DAILY_CALL_CAP": "2000",
+        "QLOO_TIMEOUT_MS": "20000",
+        "QLOO_RETRY_DELAYS_MS": "1000,3000",
+        "QLOO_MIN_INTERVAL_MS": "400",
+        "QLOO_SLOW_MS": "8000",
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "RUN_VISITOR_DAILY_CAP": "10",
+        "RUN_DAILY_CAP": "200",
+        "FREE_START_DAILY_CAP": "100",
+        "ACCOUNTS": "on",
+        "GUEST_PITCHES": "on",
+        "SAMPLE_NETWORK": "on",
+        "RP_ID": "crossfeed-preview.m1kuorg.workers.dev",
+        "APP_ORIGINS": "https://crossfeed-preview.m1kuorg.workers.dev",
+        "SIGNUP_VISITOR_DAILY_CAP": "5",
+        "NETWORKS_PER_MEMBER": "3",
+        "LAUNCHES_PER_NETWORK": "100",
+        "INVITES_PER_NETWORK": "20",
+        "API_KEYS_PER_NETWORK": "10",
+        "INVITED_SIGNUP_DAILY_CAP": "20",
+        "GUEST_SIGNINS_PER_MINUTE": "30",
+        "GUEST_SIGNINS_PER_DAY": "1000",
+        "SAMPLE_RESETS_PER_DAY": "20"
+      },
+      "secrets": { "required": ["QLOO_API_KEY", "ANTHROPIC_API_KEY", "VISITOR_SALT", "QLOO_KEY_SECRET"] },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "crossfeed-preview",
+          "database_id": "adffa0cf-3e05-4541-8e43-fd8c270f4246",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "CrossfeedAgent", "class_name": "CrossfeedAgent" },
+          { "name": "QlooGateway", "class_name": "QlooGateway" },
+          { "name": "NetworkAgent", "class_name": "NetworkAgent" },
+          { "name": "LaunchAgent", "class_name": "LaunchAgent" }
+        ]
+      },
+      "ratelimits": [
+        { "name": "API_LIMITER", "namespace_id": "1673", "simple": { "limit": 120, "period": 60 } },
+        { "name": "AUTH_LIMITER", "namespace_id": "1674", "simple": { "limit": 20, "period": 60 } },
+        { "name": "CREATE_LIMITER", "namespace_id": "1676", "simple": { "limit": 30, "period": 60 } }
+      ]
+    }
+  }
+}

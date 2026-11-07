@@ -1,0 +1,15 @@
+// The agent's run limits, shared by the agent and the UI. Per run, so runs stay
+// bounded and comparable: model turns, then Qloo calls, cache hits included.
+import type { Run } from './agent'
+
+export const MAX_TURNS = 12
+export const MAX_QLOO_CALLS = 60
+// Released shows standing in for an unreleased launch, all scored in one signal.
+export const MAX_COMPS = 3
+// A show's past guests anchor its pitch rankings, each one more Qloo search per pitch run.
+export const MAX_PAST_GUESTS = 5
+
+// Whether run `id` is the latest run and the agent is still working on it, or waiting on an answer:
+// until it ends, its insertion order and replies are the agent's to redraft, not the human's to edit.
+export const inProgress = (latest: Pick<Run, 'id' | 'status'> | null, id: string) =>
+  latest?.id === id && (latest.status === 'running' || latest.status === 'waiting')
