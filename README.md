@@ -19,8 +19,6 @@
     <br />
     <a href="https://crossfeed.m1kuorg.workers.dev"><strong>Live Demo &rarr;</strong></a>
     &middot;
-    <a href="#">Demo Video</a>
-    &middot;
     <a href="https://github.com/m1kuorg/crossfeed/issues/new?labels=bug">Report a Bug</a>
     <br />
   </p>
